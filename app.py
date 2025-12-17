@@ -29,7 +29,6 @@ if "log_data" not in st.session_state:
 # --- BACKEND ROBUSTO ---
 
 def get_session():
-    """Cria sessão com tentativas automáticas para falhas de rede"""
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
@@ -49,7 +48,6 @@ def api_login(session):
         return None
 
 def api_search_and_get_links(token, codigo_venda):
-    """Worker com lógica de persistência (Retry)"""
     session = get_session()
     resultado = {
         "venda": codigo_venda,
@@ -80,51 +78,39 @@ def api_search_and_get_links(token, codigo_venda):
                 continue
 
             data = res.json()
-            
             item_alvo = None
+            
             if data and "list" in data and len(data["list"]) > 0:
+                # FILTRAGEM RIGOROSA: Busca apenas "Nota Fiscal"
                 for item in data["list"]:
                     venda_api = str(item.get("codigoVenda", "")).strip()
                     nota_api = str(item.get("numero", "")).strip()
+                    tipo_desc = str(item.get("tipoDescricao", "")).strip()
                     alvo = str(codigo_venda).strip()
                     
-                    if (venda_api == alvo or nota_api == alvo) and item.get("tipo") == 2:
+                    # Critério: O código deve bater E o tipo deve ser "Nota Fiscal"
+                    if (venda_api == alvo or nota_api == alvo) and tipo_desc == "Nota Fiscal":
                         item_alvo = item
                         break
-                
-                if not item_alvo:
-                    for item in data["list"]:
-                        venda_api = str(item.get("codigoVenda", "")).strip()
-                        if venda_api == str(codigo_venda).strip():
-                            item_alvo = item
-                            break
             
             if not item_alvo:
                 if attempt < max_attempts - 1:
                     time.sleep(1)
                     continue
                 else:
-                    resultado["msg"] = "Venda não encontrada ou sem Nota Fiscal"
+                    resultado["msg"] = "NF-e não encontrada (Apenas Notas de Serviço detectadas ou inexistente)"
                     break 
 
             if item_alvo:
-                link_normal = item_alvo.get("pdfLink")
-                if link_normal:
-                    try:
-                        r_norm = session.get(link_normal, headers=headers, timeout=30)
-                        if r_norm.status_code == 200 and r_norm.content.startswith(b'%PDF'):
-                            resultado["pdf_normal"] = r_norm.content
-                    except: pass 
-
-                link_simples = item_alvo.get("pdfSimplificadoLink")
-                if not link_simples: link_simples = item_alvo.get("pdfLink")
-                
-                if link_simples:
-                    try:
-                        r_simp = session.get(link_simples, headers=headers, timeout=30)
-                        if r_simp.status_code == 200 and r_simp.content.startswith(b'%PDF'):
-                            resultado["pdf_simplificado"] = r_simp.content
-                    except: pass
+                # Download dos PDFs (Normal e Simplificado)
+                for key_link, res_key in [("pdfLink", "pdf_normal"), ("pdfSimplificadoLink", "pdf_simplificado")]:
+                    link = item_alvo.get(key_link)
+                    if link:
+                        try:
+                            r_pdf = session.get(link, headers=headers, timeout=30)
+                            if r_pdf.status_code == 200 and r_pdf.content.startswith(b'%PDF'):
+                                resultado[res_key] = r_pdf.content
+                        except: pass
 
                 if resultado["pdf_normal"] or resultado["pdf_simplificado"]:
                     resultado["status"] = "sucesso"
@@ -132,10 +118,7 @@ def api_search_and_get_links(token, codigo_venda):
                     resultado["cliente"] = item_alvo.get("clienteNome")
                     break 
                 else:
-                    if attempt < max_attempts - 1:
-                        time.sleep(1)
-                        continue
-                    resultado["msg"] = "Erro ao baixar PDF"
+                    resultado["msg"] = "Erro ao baixar arquivos da NF-e"
             
         except Exception as e:
             if attempt < max_attempts - 1:
@@ -159,9 +142,8 @@ def merge_pdfs(pdf_list):
     return output
 
 # --- INTERFACE ---
-
 st.title("🛡️ PharmUP Turbo Pro")
-st.markdown(f"**Usuário:** {PHARMUP_USER} | **Status:** Sistema Blindado (Ordem Preservada)")
+st.markdown(f"**Usuário:** {PHARMUP_USER} | **Filtro Ativo:** Apenas Notas Fiscais (Ignorando Serviços)")
 
 col_input, col_status = st.columns([1, 2])
 
@@ -173,7 +155,6 @@ if btn_process:
     if not vendas_input.strip():
         st.warning("Lista vazia.")
     else:
-        # Limpa dados antigos
         st.session_state.buffers_normais = []
         st.session_state.buffers_simples = []
         st.session_state.log_data = []
@@ -192,44 +173,35 @@ if btn_process:
             if not token:
                 st.error("Erro fatal: Não foi possível logar.")
             else:
-                status_text.info(f"Processando {total_codigos} vendas com segurança...")
+                status_text.info(f"Processando {total_codigos} vendas...")
                 
-                # Dicionário para armazenar resultados por índice para manter a ordem original
                 resultados_ordenados = {}
-                
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                    # Mapeia cada busca ao seu índice original (posição na lista)
                     future_to_index = {executor.submit(api_search_and_get_links, token, cod): i for i, cod in enumerate(codigos)}
                     completed = 0
                     
                     for future in concurrent.futures.as_completed(future_to_index):
                         index_original = future_to_index[future]
                         data = future.result()
-                        
-                        # Armazena o resultado na posição correta
                         resultados_ordenados[index_original] = data
-                        
                         completed += 1
                         status_bar.progress(completed / total_codigos)
+                        
                         if data['status'] == 'sucesso':
-                             status_text.text(f"✅ {data['venda']} - OK")
+                             status_text.text(f"✅ {data['venda']} - NF-e OK")
                         else:
                              status_text.text(f"⚠️ {data['venda']} - {data['msg']}")
 
-                # --- RECONSTRUÇÃO DA LISTA NA ORDEM ORIGINAL ---
                 for i in range(total_codigos):
                     res = resultados_ordenados[i]
-                    
-                    # Salva logs (na ordem correta)
                     log_entry = {
                         "Venda": res["venda"],
                         "Nota": res.get("nota") if res["status"] == "sucesso" else "-",
                         "Cliente": res.get("cliente") if res["status"] == "sucesso" else res.get("msg"),
-                        "Status": "✅ Sucesso" if res["status"] == "sucesso" else "❌ Falha"
+                        "Status": "✅ NF-e" if res["status"] == "sucesso" else "❌ Ignorada/Erro"
                     }
                     st.session_state.log_data.append(log_entry)
                     
-                    # Adiciona aos buffers seguindo a ordem da lista de entrada
                     if res["status"] == "sucesso":
                         if res["pdf_normal"]: st.session_state.buffers_normais.append(res["pdf_normal"])
                         if res["pdf_simplificado"]: st.session_state.buffers_simples.append(res["pdf_simplificado"])
@@ -237,37 +209,24 @@ if btn_process:
                 status_text.success("Processamento finalizado!")
                 status_bar.empty()
 
-# --- EXIBIÇÃO DE RESULTADOS E DOWNLOADS ---
+# --- EXIBIÇÃO DE RESULTADOS ---
 if st.session_state.dados_processados:
     with col_status:
         st.divider()
-        
-        st.write("#### 📊 Relatório Geral")
+        st.write("#### 📊 Relatório de NF-e")
         st.dataframe(st.session_state.log_data, use_container_width=True, height=250)
         
-        lista_pendencias = [d["Venda"] for d in st.session_state.log_data if "Falha" in d["Status"]]
+        lista_pendencias = [d["Venda"] for d in st.session_state.log_data if "❌" in d["Status"]]
         
         if lista_pendencias:
-            st.error(f"⚠️ **{len(lista_pendencias)} Vendas sem Nota Fiscal encontrada:**")
-            st.caption("Passe o mouse no canto direito da caixa abaixo para copiar a lista para o Teams 👇")
-            
-            texto_copiar = "\n".join(lista_pendencias)
-            st.code(texto_copiar, language="text")
-        else:
-            st.success("✅ Todas as notas foram encontradas! Nada para enviar ao financeiro.")
+            st.error(f"⚠️ **{len(lista_pendencias)} Itens sem Nota Fiscal (Podem ser apenas Serviços):**")
+            st.code("\n".join(lista_pendencias), language="text")
 
         st.divider()
-        st.write("#### 📥 Baixar Arquivos (Ordem da Lista Original)")
         c1, c2 = st.columns(2)
-        
         if st.session_state.buffers_normais:
             merged = merge_pdfs(st.session_state.buffers_normais)
-            c1.download_button("📄 Baixar Notas (A4)", merged, f"Notas_{datetime.now().strftime('%H%M')}.pdf", "application/pdf", type="primary", use_container_width=True)
-        else:
-            c1.warning("Sem notas A4.")
-            
+            c1.download_button("📄 Notas NF-e (A4)", merged, f"NFe_{datetime.now().strftime('%H%M')}.pdf", "application/pdf", type="primary", use_container_width=True)
         if st.session_state.buffers_simples:
             merged_s = merge_pdfs(st.session_state.buffers_simples)
-            c2.download_button("🏷️ Baixar Etiquetas", merged_s, f"Etiquetas_{datetime.now().strftime('%H%M')}.pdf", "application/pdf", type="secondary", use_container_width=True)
-        else:
-            c2.warning("Sem etiquetas.")
+            c2.download_button("🏷️ Etiquetas NF-e", merged_s, f"Etiquetas_NFe_{datetime.now().strftime('%H%M')}.pdf", "application/pdf", type="secondary", use_container_width=True)
