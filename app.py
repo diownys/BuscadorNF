@@ -4,7 +4,7 @@ import io
 import time
 import concurrent.futures
 from pypdf import PdfWriter, PdfReader
-from datetime import datetime
+from datetime import datetime, timedelta # <-- Adicionado timedelta aqui
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -59,16 +59,28 @@ def api_search_and_get_links(token, codigo_venda):
     
     headers = {"Authorization": f"Bearer {token}", "PharmUpSession": token}
     
+    # --- MÁGICA DAS DATAS ---
+    hoje = datetime.now()
+    data_fim = hoje.strftime("%Y-%m-%dT23:59:59")
+    data_ini = (hoje - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00")
+    
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
             url_search = f"{API_BASE}/NotaFiscalSaida/List"
+            
+            # --- MÁGICA DOS PARÂMETROS ATUALIZADOS ---
             params = {
                 "filterKey": codigo_venda,
                 "sortKey": "numero",
                 "sortOrder": "desc",
                 "pageIndex": 1,
-                "pageSize": 50
+                "pageSize": 50,
+                "statusEnvio": -1,
+                "tipoNota": 2,
+                "emissaoDe": data_ini,
+                "emissaoAte": data_fim,
+                "tipoBuscaNotaFiscalSaida": 2 # Indica que é Código da Venda
             }
             
             res = session.get(url_search, headers=headers, params=params, timeout=25)
@@ -106,6 +118,10 @@ def api_search_and_get_links(token, codigo_venda):
                 for key_link, res_key in [("pdfLink", "pdf_normal"), ("pdfSimplificadoLink", "pdf_simplificado")]:
                     link = item_alvo.get(key_link)
                     if link:
+                        # Garante que o link seja absoluto caso venha relativo da API
+                        if not link.startswith('http'):
+                            link = f"{API_BASE}{link if link.startswith('/') else '/' + link}"
+                            
                         try:
                             r_pdf = session.get(link, headers=headers, timeout=30)
                             if r_pdf.status_code == 200 and r_pdf.content.startswith(b'%PDF'):
